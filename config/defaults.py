@@ -12,7 +12,7 @@ _C.MODEL.DEVICE_ID = '0'
 # Name of backbone
 _C.MODEL.NAME = 'DeMo'
 # Path to pretrained model of backbone
-_C.MODEL.PRETRAIN_PATH_T = '/path/to/your/vitb_16_224_21k.pth'
+_C.MODEL.PRETRAIN_PATH_T = '../models/clip/ViT-B-16.pt'
 # Use ImageNet pretrained model to initialize backbone or use self trained model to initialize the whole model
 # Options: 'imagenet' or 'self'
 

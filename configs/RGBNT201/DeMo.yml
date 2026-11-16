@@ -25,7 +25,7 @@ DATALOADER:
 
 DATASETS:
   NAMES: ('RGBNT201')
-  ROOT_DIR: '..'
+  ROOT_DIR: '../datasets/mmreid/RGBNT201/'
 
 SOLVER:
   BASE_LR: 0.00035
@@ -43,6 +43,6 @@ TEST:
   FEAT_NORM: 'yes'
   MISS: "nothing"
 
-OUTPUT_DIR: '..'
+OUTPUT_DIR: '../output/log/RGBNT201/demo_ori'
 
 
