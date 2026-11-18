@@ -1,5 +1,8 @@
-import torch.nn as nn
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from utils.stdout.stdprint import PRINT_ERROR
 
 
 class QuickGELU(nn.Module):
@@ -40,9 +43,13 @@ class ExpertHead(nn.Module):
         super(ExpertHead, self).__init__()
         self.expertHead = nn.ModuleList([Expert(input_dim) for _ in range(num_experts)])
 
+        # (64, 128)*7, (64, 1, 7)
     def forward(self, x_chunk, gate_head):
+        # (64, 128)*7 -> (64, 128)*7
         expert_outputs = [expert(x_chunk[i]) for i, expert in enumerate(self.expertHead)]
+        # (64, 128)*7 -> (64, 7, 128)
         expert_outputs = torch.stack(expert_outputs, dim=1)
+        # (64, 7, 128) * (64, 7, 1)
         expert_outputs = expert_outputs * gate_head.squeeze(1).unsqueeze(2)
         return expert_outputs
 
@@ -53,19 +60,28 @@ class CrossAttention(nn.Module):
         self.linear_re = nn.Sequential(nn.Linear(7 * dim, dim), QuickGELU(), nn.BatchNorm1d(dim))
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
+        # NOTE: scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
         self.q_ = nn.Linear(dim, dim, bias=qkv_bias)
         self.k_ = nn.Linear(dim, dim, bias=qkv_bias)
 
     def forward(self, x, y):
+        # 64, 7, 512
         B, N, C = y.shape
+        # 64, 512
         x = self.linear_re(x)
+        # (64, 512) -> (64, 512) -> (64, 1, 4, 128) -> (64, 4, 1, 128)
         q = self.q_(x).reshape(B, 1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        # (64, 7, 512) -> (64, 7, 4, 128) -> (64, 4, 7, 128)
         k = self.k_(y).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        # (64, 4, 1, 7)
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        gates = attn.softmax(dim=-1)
-        return gates
+        return attn
+
+        # # (64, 4, 1, 7)
+        # gates = attn.softmax(dim=-1)
+        # # (64, 4, 1, 7)
+        # return gates
 
     def forward_(self, x):
         x = self.direct_gate(x)
@@ -82,14 +98,111 @@ class GatingNetwork(nn.Module):
         return gates
 
 
+class EvidentialRouter(nn.Module):
+  def __init__(self, input_dim, num_groups=7, hidden_dim=256,
+               uncertainty_weight=1.0, noise_std=0.05,
+               noise_dropout=0.1, margin=0.05):
+    super(EvidentialRouter, self).__init__()
+
+    self.uncertainty_weight = uncertainty_weight
+    self.noise_std = noise_std
+    self.noise_dropout = noise_dropout
+    self.margin = margin
+
+    # Group-specific embedding
+    self.group_embedding = nn.Parameter(torch.zeros(1, num_groups, input_dim))
+    nn.init.trunc_normal_(self.group_embedding, std=0.02)
+
+    # Shared evidential assessment head
+    self.evidence_head = nn.Sequential(nn.Linear(input_dim, hidden_dim),
+                                       QuickGELU(),
+                                       nn.Linear(hidden_dim, 2))
+
+  def _get_stats(self, features):
+    features = features + self.group_embedding
+
+    evidence = F.softplus(self.evidence_head(features))
+
+    e_pos = evidence[..., 0]
+    e_neg = evidence[..., 1]
+
+    alpha = e_pos + 1.0
+    beta = e_neg + 1.0
+
+    strength = alpha + beta
+
+    reliability = alpha / strength
+    uncertainty = 2.0 / strength
+
+    score = (
+      torch.log(reliability.clamp_min(1e-8))
+      - self.uncertainty_weight * uncertainty
+    )
+
+    return score, uncertainty, reliability
+
+  def forward(self, features):
+    # features: [B, 7, D]
+    score, uncertainty, reliability = self._get_stats(features)
+
+    loss_evi = features.new_zeros(())
+
+    if self.training:
+      clean = features.detach()
+
+      scale = clean.std(
+        dim=-1,
+        keepdim=True,
+        unbiased=False
+      ).clamp_min(1e-6)
+
+      # Gaussian noise
+      noisy = clean + torch.randn_like(clean) * scale * self.noise_std
+
+      # Feature dropout
+      if self.noise_dropout > 0:
+        noisy = F.dropout(
+          noisy,
+          p=self.noise_dropout,
+          training=True
+        )
+
+      # Clean uncertainty
+      _, clean_u, _ = self._get_stats(clean)
+
+      # Corrupted uncertainty
+      _, noisy_u, _ = self._get_stats(noisy)
+
+      # Corrupted features should have higher uncertainty
+      loss_evi = F.relu(
+        self.margin + clean_u - noisy_u
+      ).mean()
+
+    return score, loss_evi, reliability, uncertainty
+
 class MoM(nn.Module):
     def __init__(self, input_dim, num_experts, head):
         super(MoM, self).__init__()
         self.head_dim = input_dim // head
         self.head = head
-        self.experts = nn.ModuleList(
-            [ExpertHead(self.head_dim, num_experts) for _ in range(head)])
+        # num_experts=7
+        self.experts = nn.ModuleList([ExpertHead(self.head_dim, num_experts) for _ in range(head)])
         self.gating_network = GatingNetwork(input_dim, head)
+
+        # Evidential Feature Assessment
+        self.evidential_router = EvidentialRouter(input_dim=input_dim, num_groups=num_experts,
+                                                  hidden_dim=256, uncertainty_weight=1.0,
+                                                  noise_std=0.05, noise_dropout=0.1, margin=0.05)
+
+        # Learnable evidential guidance strength
+        self.evidence_scale = nn.Parameter(torch.tensor(-4.0))
+
+        # Gate statistics for analysis
+        self.last_gate_before = None
+        self.last_gate_after = None
+        self.last_evi_score = None
+        self.last_reliability = None
+        self.last_uncertainty = None
 
     def forward(self, x1, x2, x3, x4, x5, x6, x7):
         if x1.dim() == 1:
@@ -101,6 +214,7 @@ class MoM(nn.Module):
             x6 = x6.unsqueeze(0)
             x7 = x7.unsqueeze(0)
 
+        # (64, 512) -> ((64, 128)*4)
         x1_chunk = torch.chunk(x1, self.head, dim=-1)
         x2_chunk = torch.chunk(x2, self.head, dim=-1)
         x3_chunk = torch.chunk(x3, self.head, dim=-1)
@@ -108,16 +222,41 @@ class MoM(nn.Module):
         x5_chunk = torch.chunk(x5, self.head, dim=-1)
         x6_chunk = torch.chunk(x6, self.head, dim=-1)
         x7_chunk = torch.chunk(x7, self.head, dim=-1)
-        head_input = [[x1_chunk[i], x2_chunk[i], x3_chunk[i], x4_chunk[i], x5_chunk[i], x6_chunk[i], x7_chunk[i]] for i
-                      in range(self.head)]
+        # ((64, 128)*7)*4
+        head_input = [[x1_chunk[i], x2_chunk[i], x3_chunk[i], x4_chunk[i], x5_chunk[i], x6_chunk[i], x7_chunk[i]] for i in range(self.head)]
+        # (64, 7 * 512)
         query = torch.cat([x1, x2, x3, x4, x5, x6, x7], dim=-1)
+        # (64, 7, 512)
         key = torch.stack([x1, x2, x3, x4, x5, x6, x7], dim=1)
-        gate_heads = self.gating_network(query, key)
+        # (64, 4, 1, 7)
+
+        # 1. Original MoE routing logits
+        gate_logits = self.gating_network(query, key)
+        # 2. Original Gate distribution
+        gate_before = torch.softmax(gate_logits, dim=-1)
+        # 3. Evidential Feature Assessment
+        evi_score, loss_evi, reliability, uncertainty = (self.evidential_router(key))
+        # 4. Evidentially Guided Routing
+        gamma = torch.sigmoid(self.evidence_scale)
+        gate_logits_after = (gate_logits + gamma * evi_score.unsqueeze(1).unsqueeze(2))
+        # 5. New Gate distribution
+        gate_after = torch.softmax(gate_logits_after, dim=-1)
+        # 6. Save statistics for analysis
+        self.last_gate_before = gate_before.detach()
+        self.last_gate_after = gate_after.detach()
+        self.last_evi_score = evi_score.detach()
+        self.last_reliability = reliability.detach()
+        self.last_uncertainty = uncertainty.detach()
+        # 7. Use new Gate for original Experts
+        gate_heads = gate_after
+
+
+        # ((64, 128)*7)*4, (64, 4, 1, 7) --> (64, 128)*7, (64, 1, 7)
         expert_outputs = [expert(head_input[i], gate_heads[:, i]) for i, expert in enumerate(self.experts)]
         outputs = torch.cat(expert_outputs, dim=-1).flatten(start_dim=1, end_dim=-1)
         loss = 0
         if self.training:
-            return outputs, loss
+            return outputs, loss_evi
         return outputs
 
 

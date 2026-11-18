@@ -1,4 +1,5 @@
 from yacs.config import CfgNode as CN
+from datetime import datetime
 
 _C = CN()
 # -----------------------------------------------------------------------------
@@ -173,3 +174,4 @@ _C.TEST.MISS = 'None'
 # ---------------------------------------------------------------------------- #
 # Path to checkpoint and saved log of trained model
 _C.OUTPUT_DIR = "./test"
+_C.CURRENT_TIME = datetime.now().strftime("%Y%m%d/%H%M%S")

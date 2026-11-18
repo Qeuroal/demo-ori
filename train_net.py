@@ -37,6 +37,7 @@ if __name__ == '__main__':
 
     if args.config_file != "":
         cfg.merge_from_file(args.config_file)
+        cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, cfg.CURRENT_TIME)
     cfg.merge_from_list(args.opts)
     cfg.TEST.FEAT = args.fea_cft
     cfg.freeze()
@@ -68,7 +69,7 @@ if __name__ == '__main__':
     train_loader, train_loader_normal, val_loader, num_query, num_classes, camera_num, view_num = make_dataloader(cfg)
     print("data is ready")
     model = make_model(cfg, num_class=num_classes, camera_num=camera_num, view_num=view_num)
-    if hasattr(model, 'flops'):
+    if 0 and hasattr(model, 'flops'):
         logger.info(str(model))
         n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"number of parameters:{n_parameters / 1e6}")

@@ -43,6 +43,6 @@ TEST:
   FEAT_NORM: 'yes'
   MISS: "nothing"
 
-OUTPUT_DIR: '../output/log/RGBNT201/demo_ori'
+OUTPUT_DIR: '../output/log/RGBNT201/demo_uncertainty/'
 
 
